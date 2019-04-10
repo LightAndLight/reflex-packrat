@@ -1,14 +1,39 @@
-{-# language GADTs #-}
-{-# language TemplateHaskell #-}
 {-# language LambdaCase, RecursiveDo, ScopedTypeVariables #-}
 module Reflex.Packrat where
 
+import Debug.Trace (trace)
+
+{-
+
+bug
+
+edit 0 5 1*2*3
+"1*2*3"
+Just 6
+
+edit 1 5 2
+"122*3"
+Just 1
+"12"
+
+edit 0 2 3*5
+"3*"
+Nothing
+
+edit 2 3 5
+
+quit
+
+
+reason: the 'pos' is calculated incorrectly; the upper bound of an
+edit should be minned with the size of the string
+
+
+-}
 import Reflex
 import Reflex.Network
 import Control.Monad.Fix
 import Data.Char
-import Data.GADT.Compare.TH
-import Data.Dependent.Sum ((==>))
 import Data.Vector.Unboxed (Vector)
 
 import qualified Data.Dependent.Map as DMap
@@ -101,83 +126,85 @@ getChr n dvs = do
     Failure -> pure res
     Success _ dvs' -> getChr (n-1) dvs'
 
-data EditKey a where
-  EditKey :: Int -> EditKey (Int, Int, Vector Char)
-deriveGEq ''EditKey
-deriveGCompare ''EditKey
-
-fanEdit :: Reflex t => Event t Edit -> EventSelector t EditKey
-fanEdit eEdit =
-  fan $
-  (\(Edit from to values) ->
-     let res = (from, to, values) in
-     DMap.fromList $ fmap (\ix -> EditKey ix ==> res) [from..to-1]) <$>
-  eEdit
-
 parse ::
   forall t m.
   (Reflex t, MonadHold t m, MonadFix m, Adjustable t m) =>
   Event t Edit ->
   m (Derivs t)
-parse eEdit = parse' 0 $ fanEdit eEdit
+parse = parse' 0
+
   where
-    mkChrs :: Int -> Vector Char -> EventSelector t EditKey -> m (Dynamic t (Result t Char))
-    mkChrs pos vs editES = do
+    mkChrs ::
+      Int ->
+      Vector Char ->
+      Event t Edit ->
+      m (Dynamic t (Result t Char))
+    mkChrs pos vs eEdit = do
       rec
         dPos <-
           holdDyn pos $
           attachWithMaybe
             (\p (Edit from to values) ->
                let valTo = from + Vector.length values in
-               if valTo <= p
+               if valTo < p
                then
                  if to == valTo
                  then Nothing
-                 else Just $ p + valTo - to
+                 else Just $ p + valTo
                else Nothing)
             (current dPos)
             eEdit
 
-      let
-        eEditPos =
-          switchDyn $
-          (\p -> (,) p <$> select editES (EditKey p)) <$> dPos
-
       rec
         chr <-
-          networkHold (chrsRes pos eEditPos vs editES) $
+          networkHold (chrsRes pos dPos vs eEdit) $
           attachWithMaybe
-            (\res (p, (from, to, values)) -> do
-                if from <= p && p < to
-                then
-                  let ix = p-from in
-                  if Vector.length values <= ix
-                  -- this char and those following it have been deleted
-                  then
-                    case res of
-                      Failure -> Nothing
-                      Success _ dvs -> Just . sample . current $ getChr (to-p-1) dvs
-                  -- this char has been inserted
-                  else
-                    case res of
-                      Failure -> Just $ chrsRes p eEditPos (Vector.drop (from-p) values) editES
-                      Success{} -> Nothing
-                else Nothing)
-            (current chr)
-            eEditPos
+            (\(p, res) (Edit from to values) ->
+               if p < to
+               then
+                 -- if this position is within the bounds of the edit
+                 if from <= p
+                 then
+                   -- this char and those following it up to 'to' have been deleted
+                   -- because the edit didn't provide values for them
+                   if from + Vector.length values <= p
+                   then
+                     case res of
+                       Failure -> Nothing
+                       Success _ dvs -> Just . sample . current $ getChr (to-p-1) dvs
+                   -- this char has a value provided
+                   else
+                     case res of
+                       -- there was previously nothing here, so initialise the cells from
+                       -- this position onward
+                       Failure ->
+                         Just $ chrsRes p dPos (Vector.drop (p-from) values) eEdit
+                       -- there was something here, so its result dynamic will be updated
+                       Success{} -> Nothing
+                 else Nothing
+               -- this character's position is after the edit
+               --
+               -- if the edit increases the size of the document and this character
+               -- has no result yet, then it needs to be initialised
+               else
+                 case res of
+                   Failure -> _
+                   _ -> Nothing)
+            ((,) <$> current dPos <*> current chr)
+            eEdit
       pure chr
 
     chrsRes ::
       Int ->
-      Event t (Int, (Int, Int, Vector Char)) ->
+      Dynamic t Int ->
       Vector Char ->
-      EventSelector t EditKey ->
+      Event t Edit ->
       m (Result t Char)
-    chrsRes pos eEditPos vec editES
+    chrsRes pos dPos vec eEdit
       | Vector.length vec == 0 = pure Failure
       | otherwise = do
-          dV <- holdDyn (Vector.head vec) $ editPos eEditPos
-          chr <- mkChrs (pos+1) (Vector.tail vec) editES
+          dV <- holdDyn (Vector.head vec) $ editPos dPos eEdit
+          chr <- mkChrs (pos+1) (Vector.tail vec) eEdit
           let
             d = Derivs add mul prim dec chr
             add = pAdd d
@@ -186,22 +213,57 @@ parse eEdit = parse' 0 $ fanEdit eEdit
             dec = pDecimal d
           pure $ Success dV d
 
-    editPos =
-      fmapMaybe
-      (\(pos, (from, to, values)) ->
-          if from <= pos && pos < to
-          then
-            let ix = pos-from in
-            if Vector.length values <= ix
-            -- char was deleted
-            then Nothing
-            -- char was changed
-            else Just $ values Vector.! ix
-          else Nothing)
+    editPos dPos =
+      attachWithMaybe
+      (\pos (Edit from to values) ->
+         if p < to
+         then
+           -- if this position is within the bounds of the edit
+           if from <= p
+           then
+             let ix = pos-from in
+             if Vector.length values <= ix
+             -- char was deleted
+             then Nothing
+             -- char was changed
+             else Just $ values Vector.! ix
+           -- this character occurs before the edit
+           else Nothing
+         -- this character occurs after the edit
+         --
+         -- if the edit grows the document, then this character
+         -- needs to take on the value of the character a certain
+         -- number of places to the left
+         --
+         -- similarly, if the edit shrinks the document then this character needs to
+         -- take the value of a character to the right
+         --
+         -- the edit grows the document if the size of 'values' is greater
+         -- than the span size
+         else
+           let
+             spanSize = to-from
+             increase = Vector.length values - spansSize
+           in
+           case compare increase 0 of
+             -- the document grows
+             --
+             -- we take on the value of the character 'increase' places to the left
+             GT -> _
+             -- the document didn't change size. this character didn't change.
+             EQ -> Nothing
+             -- the document shrinks
+             --
+             -- we take on the value of the character '-increase' places to the right
+             LT -> _)
+      (current dPos)
 
-    parse' :: Int -> EventSelector t EditKey -> m (Derivs t)
-    parse' pos editES = do
-      chr <- mkChrs pos Vector.empty editES
+    parse' ::
+      Int ->
+      Event t Edit ->
+      m (Derivs t)
+    parse' pos eEdit = do
+      chr <- mkChrs pos Vector.empty eEdit
       let
         d = Derivs add mul prim dec chr
         add = pAdd d
