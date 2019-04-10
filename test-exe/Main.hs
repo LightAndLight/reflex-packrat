@@ -12,6 +12,8 @@ import Control.Monad.Fix
 import Data.IORef
 import Text.Read
 
+import qualified Data.Vector.Unboxed as Vector
+
 network ::
   ( Reflex t, MonadHold t m, MonadFix m, Adjustable t m
   , MonadIO m, TriggerEvent t m
@@ -27,7 +29,10 @@ network = do
       fmapMaybe
         (\case
             "edit":from:to:val ->
-              Edit <$> readMaybe from <*> readMaybe to <*> pure (concat val)
+              Edit <$>
+              readMaybe from <*>
+              readMaybe to <*>
+              pure (Vector.fromList $ concat val)
             _ -> Nothing)
         eWords
     eQuit = fmapMaybe (\case; "quit":_ -> Just (); _ -> Nothing) eWords

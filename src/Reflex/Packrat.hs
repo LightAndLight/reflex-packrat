@@ -9,10 +9,12 @@ import Control.Monad.Fix
 import Data.Char
 import Data.GADT.Compare.TH
 import Data.Dependent.Sum ((==>))
+import Data.Vector.Unboxed (Vector)
 
 import qualified Data.Dependent.Map as DMap
+import qualified Data.Vector.Unboxed as Vector
 
-data Edit = Edit !Int !Int String
+data Edit = Edit !Int !Int !(Vector Char)
   deriving Show
 
 data Result t a
@@ -100,7 +102,7 @@ getChr n dvs = do
     Success _ dvs' -> getChr (n-1) dvs'
 
 data EditKey a where
-  EditKey :: Int -> EditKey (Int, Int, String)
+  EditKey :: Int -> EditKey (Int, Int, Vector Char)
 deriveGEq ''EditKey
 deriveGCompare ''EditKey
 
@@ -119,14 +121,14 @@ parse ::
   m (Derivs t)
 parse eEdit = parse' 0 $ fanEdit eEdit
   where
-    mkChrs :: Int -> String -> EventSelector t EditKey -> m (Dynamic t (Result t Char))
+    mkChrs :: Int -> Vector Char -> EventSelector t EditKey -> m (Dynamic t (Result t Char))
     mkChrs pos vs editES = do
       rec
         dPos <-
           holdDyn pos $
           attachWithMaybe
             (\p (Edit from to values) ->
-               let valTo = from + length values in
+               let valTo = from + Vector.length values in
                if valTo <= p
                then
                  if to == valTo
@@ -149,7 +151,7 @@ parse eEdit = parse' 0 $ fanEdit eEdit
                 if from <= p && p < to
                 then
                   let ix = p-from in
-                  if length values <= ix
+                  if Vector.length values <= ix
                   -- this char and those following it have been deleted
                   then
                     case res of
@@ -158,7 +160,7 @@ parse eEdit = parse' 0 $ fanEdit eEdit
                   -- this char has been inserted
                   else
                     case res of
-                      Failure -> Just $ chrsRes p eEditPos (drop (from-p) values) editES
+                      Failure -> Just $ chrsRes p eEditPos (Vector.drop (from-p) values) editES
                       Success{} -> Nothing
                 else Nothing)
             (current chr)
@@ -167,21 +169,22 @@ parse eEdit = parse' 0 $ fanEdit eEdit
 
     chrsRes ::
       Int ->
-      Event t (Int, (Int, Int, String)) ->
-      String ->
+      Event t (Int, (Int, Int, Vector Char)) ->
+      Vector Char ->
       EventSelector t EditKey ->
       m (Result t Char)
-    chrsRes _ _ [] _ = pure Failure
-    chrsRes pos eEditPos (v:vs) editES = do
-      dV <- holdDyn v $ editPos eEditPos
-      chr <- mkChrs (pos+1) vs editES
-      let
-        d = Derivs add mul prim dec chr
-        add = pAdd d
-        mul = pMul d
-        prim = pPrimary d
-        dec = pDecimal d
-      pure $ Success dV d
+    chrsRes pos eEditPos vec editES
+      | Vector.length vec == 0 = pure Failure
+      | otherwise = do
+          dV <- holdDyn (Vector.head vec) $ editPos eEditPos
+          chr <- mkChrs (pos+1) (Vector.tail vec) editES
+          let
+            d = Derivs add mul prim dec chr
+            add = pAdd d
+            mul = pMul d
+            prim = pPrimary d
+            dec = pDecimal d
+          pure $ Success dV d
 
     editPos =
       fmapMaybe
@@ -189,16 +192,16 @@ parse eEdit = parse' 0 $ fanEdit eEdit
           if from <= pos && pos < to
           then
             let ix = pos-from in
-            if length values <= ix
+            if Vector.length values <= ix
             -- char was deleted
             then Nothing
             -- char was changed
-            else Just $ values !! ix
+            else Just $ values Vector.! ix
           else Nothing)
 
     parse' :: Int -> EventSelector t EditKey -> m (Derivs t)
     parse' pos editES = do
-      chr <- mkChrs pos "" editES
+      chr <- mkChrs pos Vector.empty editES
       let
         d = Derivs add mul prim dec chr
         add = pAdd d
