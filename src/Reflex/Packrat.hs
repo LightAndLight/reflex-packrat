@@ -1,89 +1,112 @@
 {-# language GADTs #-}
 {-# language TemplateHaskell #-}
 {-# language LambdaCase, RecursiveDo, ScopedTypeVariables #-}
+{-# language GeneralizedNewtypeDeriving #-}
+{-# language DeriveFunctor, StandaloneDeriving #-}
+{-# language RecursiveDo #-}
 module Reflex.Packrat where
 
 import Reflex
 import Reflex.Network
 import Control.Applicative
 import Control.Monad.Fix
+import Control.Monad.State
 import Data.Char
 import Data.GADT.Compare.TH
 import Data.Dependent.Sum ((==>))
-import Data.Maybe (fromMaybe)
+import Data.Map.Lazy (Map)
+import Data.Maybe (fromMaybe, fromJust)
 import Data.Vector.Unboxed (Vector)
 
-import qualified Data.Dependent.Map as DMap
-import qualified Data.Vector.Unboxed as Vector
+import GHC.Exts (Any)
+import Unsafe.Coerce (unsafeCoerce)
 
-data Edit = Edit !Int !Int !(Vector Char)
-  deriving Show
+import qualified Data.Dependent.Map as DMap
+import qualified Data.Map as Map
+import qualified Data.Vector as Boxed
+import qualified Data.Vector.Unboxed as Vector
 
 data Result t a
   = Success (Dynamic t a) (Derivs t)
   | Failure
+deriving instance Reflex t => Functor (Result t)
 
-data Derivs t
-  = Derivs
-  { dvAdd :: Dynamic t (Result t Int)
-  , dvMul :: Dynamic t (Result t Int)
-  , dvPrimary :: Dynamic t (Result t Int)
-  , dvDecimal :: Dynamic t (Result t Int)
-  , dvChar :: Dynamic t (Result t Char)
+data Edit = Edit !Int !Int !(Vector Char)
+  deriving Show
+
+newtype Derivs t = Derivs { unDerivs :: Boxed.Vector (Dynamic t (Result t Any)) }
+
+newtype Prod t a
+  = Prod
+  { unProd :: Derivs t -> Dynamic t (Result t a)
   }
+deriving instance Reflex t => Functor (Prod t)
 
-pAdd :: Reflex t => Derivs t -> Dynamic t (Result t Int)
-pAdd d = do
-  mul <- dvMul d
-  case mul of
-    Success l d' -> do
-      char <- dvChar d'
-      case char of
-        Success dC d'' -> do
-          c <- dC
-          case c of
-            '+' -> do
-              add <- dvAdd d''
-              case add of
-                Success r d''' -> pure $ Success ((+) <$> l <*> r) d'''
-                res -> pure res
-            _ -> pure mul
-        Failure -> pure mul
-    res -> pure res
+instance Reflex t => Applicative (Prod t) where
+  pure a = Prod $ \dvs -> pure $ Success (pure a) dvs
+  Prod mf <*> Prod ma = do
+    Prod $ \dvs -> do
+      fRes <- mf dvs
+      case fRes of
+        Failure -> pure Failure
+        Success dF dvs' -> do
+          aRes <- ma dvs'
+          pure $
+            case aRes of
+              Failure -> Failure
+              Success dA dvs'' -> Success (dF <*> dA) dvs''
 
-pMul :: Reflex t => Derivs t -> Dynamic t (Result t Int)
-pMul d = do
-  primary <- dvPrimary d
-  case primary of
-    Success l d' -> do
-      char <- dvChar d'
-      case char of
-        Success dC d'' -> do
-          c <- dC
-          case c of
-            '*' -> do
-              mul <- dvMul d''
-              case mul of
-                Success r d''' -> pure $ Success ((*) <$> l <*> r) d'''
-                res -> pure res
-            _ -> pure primary
-        Failure -> pure primary
-    res -> pure res
+instance Reflex t => Alternative (Prod t) where
+  empty = Prod $ \_ -> pure Failure
+  Prod ma <|> Prod mb =
+    Prod $ \dvs -> do
+      aRes <- ma dvs
+      case aRes of
+        Failure -> mb dvs
+        Success{} -> pure aRes
 
-pPrimary :: Reflex t => Derivs t -> Dynamic t (Result t Int)
-pPrimary d = dvDecimal d
+-- 0 is reserved for char
+newtype Grammar t a
+  = Grammar
+  { unGrammar :: State (Map Int (Prod t Any)) a
+  }
+  deriving (Functor, Applicative, Monad, MonadFix)
 
-pDecimal :: Reflex t => Derivs t -> Dynamic t (Result t Int)
-pDecimal d = do
-  char <- dvChar d
-  case char of
-    Success dC d' -> do
-      c <- dC
-      pure $
-        if isDigit c
-        then Success (pure $ read [c]) d'
-        else Failure
-    Failure -> pure Failure
+dvChar :: Derivs t -> Dynamic t (Result t Char)
+dvChar (Derivs dvs) = unsafeCoerce (dvs Boxed.! 0)
+
+rule :: forall t a. Prod t a -> Grammar t (Prod t a)
+rule p = Grammar $ do
+  m <- get
+  let n = Map.size m
+  put $ Map.insert n (unsafeCoerce p :: Prod t Any) m
+  pure . Prod $ \(Derivs dvs) -> unsafeCoerce (dvs Boxed.! n)
+
+anyChar :: Prod t Char
+anyChar = Prod dvChar
+
+satisfy :: Reflex t => (Char -> Bool) -> Prod t Char
+satisfy f =
+  Prod $ \(Derivs dvs) -> do
+    res <- unsafeCoerce (dvs Boxed.! 0)
+    case res of
+      Success dC dvs' -> do
+        c <- dC
+        pure $
+          if f c
+          then Success dC dvs'
+          else Failure
+      _ -> pure Failure
+
+additionGrammar :: Reflex t => Grammar t (Prod t Int)
+additionGrammar = do
+  digitP <- rule $ read . pure <$> satisfy isDigit
+  primaryP <- rule $ digitP
+  rec
+    mulP <- rule $ (*) <$> primaryP <* satisfy (=='*') <*> mulP
+  rec
+    addP <- rule $ (+) <$> mulP <* satisfy (=='+') <*> addP
+  pure addP
 
 getString :: Reflex t => Derivs t -> Dynamic t [Char]
 getString dvs =
@@ -109,12 +132,26 @@ deriveGEq ''EditKey
 deriveGCompare ''EditKey
 
 parse ::
-  forall t m.
+  forall t m a.
   (Reflex t, MonadHold t m, MonadFix m, Adjustable t m) =>
+  Grammar t (Prod t a) ->
   Event t Edit ->
-  m (Derivs t)
-parse = parse' 0
+  m (Dynamic t String, Dynamic t (Result t a))
+parse (Grammar grammar) e = do
+  derivs <- parse' 0 e
+  pure (getString derivs, unProd outputProd derivs)
   where
+    outputProd :: Prod t a
+    mapping :: Map Int (Prod t Any)
+    (outputProd, mapping) =
+      runState grammar $
+      Map.singleton 0 (unsafeCoerce (Prod dvChar) :: Prod t Any)
+
+    mappingVec :: Boxed.Vector (Prod t Any)
+    mappingVec =
+      Boxed.generate (Map.size mapping) $
+      \ix -> fromJust $ Map.lookup ix mapping
+
     mkChrs ::
       Int ->
       Vector Char ->
@@ -200,12 +237,7 @@ parse = parse' 0
       | otherwise = do
           dV <- holdDyn (Vector.head vec) $ editPos eEditPos
           chr <- mkChrs (pos+1) (Vector.tail vec) eEdit after
-          let
-            d = Derivs add mul prim dec chr
-            add = pAdd d
-            mul = pMul d
-            prim = pPrimary d
-            dec = pDecimal d
+          let d = Derivs $ (\(Prod f) -> f d) <$> mappingVec
           pure $ Success dV d
 
     editPos =
@@ -218,10 +250,5 @@ parse = parse' 0
     parse' :: Int -> Event t Edit -> m (Derivs t)
     parse' pos eEdit = do
       chr <- mkChrs pos Vector.empty eEdit Nothing
-      let
-        d = Derivs add mul prim dec chr
-        add = pAdd d
-        mul = pMul d
-        prim = pPrimary d
-        dec = pDecimal d
+      let d = Derivs $ (\(Prod f) -> f d) <$> mappingVec
       pure d

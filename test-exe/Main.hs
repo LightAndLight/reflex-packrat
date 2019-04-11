@@ -45,9 +45,9 @@ network = do
 
   performEvent_ $ liftIO (writeIORef quitRef True) <$ eQuit
 
-  derivs <- parse eEdit
-  performEvent_ $ liftIO . print <$> updated (getSuccess $ pAdd derivs)
-  performEvent_ $ liftIO . print <$> updated (getString derivs)
+  (dString, dRes) <- parse additionGrammar eEdit
+  performEvent_ $ liftIO . print <$> updated (getSuccess dRes)
+  performEvent_ $ liftIO . print <$> updated dString
 
   void . liftIO $ forkIO loop
 
