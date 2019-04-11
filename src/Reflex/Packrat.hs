@@ -6,6 +6,8 @@
 {-# language RecursiveDo #-}
 module Reflex.Packrat where
 
+import Debug.Trace (trace, traceShow)
+
 import Reflex
 import Reflex.Network
 import Control.Applicative
@@ -34,7 +36,10 @@ deriving instance Reflex t => Functor (Result t)
 data Edit = Edit !Int !Int !(Vector Char)
   deriving Show
 
-newtype Derivs t = Derivs { unDerivs :: Boxed.Vector (Dynamic t (Result t Any)) }
+newtype Derivs t
+  = Derivs
+  { unDerivs :: Boxed.Vector (Dynamic t (Result t Any))
+  }
 
 newtype Prod t a
   = Prod
@@ -44,7 +49,7 @@ deriving instance Reflex t => Functor (Prod t)
 
 instance Reflex t => Applicative (Prod t) where
   pure a = Prod $ \dvs -> pure $ Success (pure a) dvs
-  Prod mf <*> Prod ma = do
+  Prod mf <*> Prod ma =
     Prod $ \dvs -> do
       fRes <- mf dvs
       case fRes of
@@ -69,8 +74,7 @@ instance Reflex t => Alternative (Prod t) where
 newtype Grammar t a
   = Grammar
   { unGrammar :: State (Map Int (Prod t Any)) a
-  }
-  deriving (Functor, Applicative, Monad, MonadFix)
+  } deriving (Functor, Applicative, Monad, MonadFix)
 
 dvChar :: Derivs t -> Dynamic t (Result t Char)
 dvChar (Derivs dvs) = unsafeCoerce (dvs Boxed.! 0)
@@ -87,8 +91,8 @@ anyChar = Prod dvChar
 
 satisfy :: Reflex t => (Char -> Bool) -> Prod t Char
 satisfy f =
-  Prod $ \(Derivs dvs) -> do
-    res <- unsafeCoerce (dvs Boxed.! 0)
+  Prod $ \dvs -> do
+    res <- dvChar dvs
     case res of
       Success dC dvs' -> do
         c <- dC
@@ -101,12 +105,20 @@ satisfy f =
 additionGrammar :: Reflex t => Grammar t (Prod t Int)
 additionGrammar = do
   digitP <- rule $ read . pure <$> satisfy isDigit
-  primaryP <- rule $ digitP
+  primaryP <- rule digitP
   rec
-    mulP <- rule $ (*) <$> primaryP <* satisfy (=='*') <*> mulP
+    mulP <- rule $
+      (*) <$> primaryP <* satisfy (=='*') <*> mulP <|>
+      primaryP
   rec
-    addP <- rule $ (+) <$> mulP <* satisfy (=='+') <*> addP
+    addP <- rule $
+      (+) <$> mulP <* satisfy (=='+') <*> addP <|>
+      mulP
   pure addP
+
+digitGrammar :: Reflex t => Grammar t (Prod t Int)
+digitGrammar =
+  rule $ read . pure <$> satisfy isDigit
 
 getString :: Reflex t => Derivs t -> Dynamic t [Char]
 getString dvs =
@@ -237,7 +249,7 @@ parse (Grammar grammar) e = do
       | otherwise = do
           dV <- holdDyn (Vector.head vec) $ editPos eEditPos
           chr <- mkChrs (pos+1) (Vector.tail vec) eEdit after
-          let d = Derivs $ (\(Prod f) -> f d) <$> mappingVec
+          let d = mkDerivs chr
           pure $ Success dV d
 
     editPos =
@@ -247,8 +259,21 @@ parse (Grammar grammar) e = do
           then Just $ values Vector.! (pos - from)
           else Nothing)
 
+    mkDerivs chr =
+      let
+        d =
+          Derivs $
+          Boxed.imap
+            (\k (Prod f) ->
+               if k == 0
+               then unsafeCoerce chr :: Dynamic t (Result t Any)
+               else f d)
+            mappingVec
+      in
+        d
+
     parse' :: Int -> Event t Edit -> m (Derivs t)
     parse' pos eEdit = do
       chr <- mkChrs pos Vector.empty eEdit Nothing
-      let d = Derivs $ (\(Prod f) -> f d) <$> mappingVec
+      let d = mkDerivs chr
       pure d
