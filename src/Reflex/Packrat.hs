@@ -6,8 +6,6 @@
 {-# language RecursiveDo #-}
 module Reflex.Packrat where
 
-import Debug.Trace (trace, traceShow)
-
 import Reflex
 import Reflex.Network
 import Control.Applicative
@@ -181,7 +179,7 @@ parse (Grammar grammar) e = do
                    in
                      if change == 0
                      then Nothing
-                     else trace ("from " <> show p <> " to " <> show (p+change)) $ Just $ p + change
+                     else Just $ p + change
                  else Nothing)
             (current dPos)
             eEdit
@@ -248,7 +246,7 @@ parse (Grammar grammar) e = do
                      else Nothing
                else Nothing)
             (current chr)
-            (traceEvent "edit" eEditPos)
+            eEditPos
       pure chr
 
     chrsRes ::
