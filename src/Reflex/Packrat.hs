@@ -128,10 +128,10 @@ getString dvs =
 getSuccess :: Reflex t => Dynamic t (Result t a) -> Dynamic t (Maybe a)
 getSuccess d = d >>= \case; Failure -> pure Nothing; Success a _ -> Just <$> a
 
-getChr :: (Reflex t, MonadSample t m) => Int -> Derivs t -> m (Result t Char)
-getChr 0 dvs = sample . current $ dvChar dvs
+getChr :: Reflex t => Int -> Derivs t -> Dynamic t (Result t Char)
+getChr 0 dvs = dvChar dvs
 getChr n dvs = do
-  res <- sample . current $ dvChar dvs
+  res <- dvChar dvs
   case res of
     Failure -> pure res
     Success _ dvs' -> getChr (n-1) dvs'
@@ -185,15 +185,24 @@ parse (Grammar grammar) e = do
             eEdit
 
       let
-        eEditPos =
-          switchDyn $
-          (\p -> (,) p <$> eEdit) <$> dPos
+        eEditPos = switchDyn $ (\p -> (,) p <$> eEdit) <$> dPos
 
       rec
+        dAfter <-
+          fmap join .
+          holdDyn (pure Failure) $
+          (\res (p, Edit from to values) ->
+             case res of
+               Failure -> pure Failure
+               Success _ dvs ->
+                 getChr (max (from + Vector.length values) to - p - 1) dvs) <$>
+          current chr <@>
+          eEditPos
+
         chr <-
           networkHold (chrsRes pos eEditPos vs eEdit after) $
           attachWithMaybe
-            (\res (p, Edit from to values) ->
+            (\(after', res) (p, Edit from to values) ->
                {-
 
                F                                    T
@@ -226,26 +235,27 @@ parse (Grammar grammar) e = do
                -}
                if from <= p && p < max (from + Vector.length values) to
                then
+                 let valuesEnd = from + Vector.length values in
                  case res of
-                   Success _ dvs ->
-                     if from + Vector.length values < to
-                     then
-                       if p == from + Vector.length values
-                       then Just $ getChr (to-p-1) dvs
-                       else Nothing
-                     else
-                       if p == to
-                       then
-                         Just $ do
-                           after' <- getChr (from + Vector.length values - p - 1) dvs
-                           chrsRes p eEditPos values eEdit $ Just after'
-                       else Nothing
-                   Failure ->
-                     if p == from
-                     then Just $ chrsRes p eEditPos values eEdit Nothing
-                     else Nothing
+                   Success{}
+                     -- F + VS ~> T will be deleted
+                     | valuesEnd < to ->
+                         if p == from + Vector.length values
+                         then Just $ pure after'
+                         else Nothing
+                     -- T ~> F + VS will be created
+                     | valuesEnd >= to ->
+                         if p == to
+                         then
+                           Just $
+                           chrsRes p eEditPos (Vector.drop (from-to) values) eEdit (Just after')
+                         else Nothing
+                   Failure
+                     | p == from ->
+                         Just $ chrsRes p eEditPos values eEdit Nothing
+                     | otherwise -> Nothing
                else Nothing)
-            (current chr)
+            ((,) <$> current dAfter <*> current chr)
             eEditPos
       pure chr
 
