@@ -138,11 +138,6 @@ getChr n dvs = do
     Failure -> pure res
     Success _ dvs' -> getChr (n-1) dvs'
 
-data EditKey a where
-  EditKey :: Int -> EditKey (Int, Int, Vector Char)
-deriveGEq ''EditKey
-deriveGCompare ''EditKey
-
 parse ::
   forall t m a.
   (Reflex t, MonadHold t m, MonadFix m, Adjustable t m) =>
@@ -186,7 +181,7 @@ parse (Grammar grammar) e = do
                    in
                      if change == 0
                      then Nothing
-                     else Just $ p + change
+                     else trace ("from " <> show p <> " to " <> show (p+change)) $ Just $ p + change
                  else Nothing)
             (current dPos)
             eEdit
@@ -201,40 +196,59 @@ parse (Grammar grammar) e = do
           networkHold (chrsRes pos eEditPos vs eEdit after) $
           attachWithMaybe
             (\res (p, Edit from to values) ->
-               let
-                 spanSize = to - from
-                 change = Vector.length values - spanSize
-                 valuesEnd = from + Vector.length values
-               in
-                 case compare change 0 of
-                   -- some things may have been deleted
-                   LT ->
-                     if p == valuesEnd
+               {-
+
+               F                                    T
+               |-------------------(T - F)----------|
+               |------VS-------|
+                               |---(T - (F + VS))---|
+                            (F + VS)
+               |--( case 1 )---|
+                               ^
+                               |
+                           ( case 2 )
+
+
+                                            T
+               F                            |--(F + VS - T)--|
+               |-----------(T - F)----------|
+               |---------------------VS----------------------|
+                                                          (F + VS)
+               |---------( case 3 )---------|
+                                            ^
+                                            |
+                                        ( case 4 )
+
+
+               case 1: if p already exists here then it changes
+               case 2: set p to whatever is at T
+               case 3: if p already exists here then it changes
+               case 4: insert new values at p, and have them terminate with whatever is at T
+
+               -}
+               if from <= p && p < max (from + Vector.length values) to
+               then
+                 case res of
+                   Success _ dvs ->
+                     if from + Vector.length values < to
                      then
-                       case res of
-                         Failure -> Nothing
-                         Success _ dvs -> Just $ getChr (to-valuesEnd-1) dvs
-                     -- the character was changed, not deleted
-                     else Nothing
-                   EQ ->
-                     case res of
-                       Failure ->
-                         Just $ chrsRes p eEditPos (Vector.drop (p-from) values) eEdit Nothing
-                       Success{} -> Nothing
-                   -- some things may have been added
-                   GT ->
+                       if p == from + Vector.length values
+                       then Just $ getChr (to-p-1) dvs
+                       else Nothing
+                     else
+                       if p == to
+                       then
+                         Just $ do
+                           after' <- getChr (from + Vector.length values - p - 1) dvs
+                           chrsRes p eEditPos values eEdit $ Just after'
+                       else Nothing
+                   Failure ->
                      if p == from
-                     -- create new cells
-                     then
-                       Just $ do
-                         after' <-
-                           case res of
-                             Failure -> pure res
-                             Success _ dvs -> sample $ current (dvChar dvs)
-                         chrsRes p eEditPos values eEdit $ Just after'
-                     else Nothing)
+                     then Just $ chrsRes p eEditPos values eEdit Nothing
+                     else Nothing
+               else Nothing)
             (current chr)
-            eEditPos
+            (traceEvent "edit" eEditPos)
       pure chr
 
     chrsRes ::
@@ -245,7 +259,8 @@ parse (Grammar grammar) e = do
       Maybe (Result t Char) ->
       m (Result t Char)
     chrsRes pos eEditPos vec eEdit after
-      | Vector.length vec == 0 = pure $ fromMaybe Failure after
+      | Vector.length vec == 0 =
+        pure $ fromMaybe Failure after
       | otherwise = do
           dV <- holdDyn (Vector.head vec) $ editPos eEditPos
           chr <- mkChrs (pos+1) (Vector.tail vec) eEdit after
